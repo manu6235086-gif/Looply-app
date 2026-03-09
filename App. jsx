@@ -1,0 +1,481 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Camera, CameraOff, Mic, MicOff, SkipForward, Play, Loader2, Users, AlertCircle, Sparkles, Shield, ShieldAlert, Languages, MessageSquarePlus, Zap, Wand2 } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { 
+  getFirestore, collection, doc, setDoc, getDoc, getDocs, 
+  addDoc, onSnapshot, deleteDoc, updateDoc, query
+} from 'firebase/firestore';
+
+// --- Firebase Configuration ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'looply-core-v1';
+
+const configuration = {
+  iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }],
+  iceCandidatePoolSize: 10,
+};
+
+const LooplyLogo = ({ className = "w-10 h-10" }) => (
+  <svg viewBox="0 0 100 60" className={className} fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M30 15C18 15 10 25 10 35C10 45 18 55 30 55C38 55 45 50 50 45C55 50 62 55 70 55C82 55 90 45 90 35C90 25 82 15 70 15C62 15 55 20 50 25C45 20 38 15 30 15Z" 
+      stroke="url(#looplyGradient)" strokeWidth="6" strokeLinecap="round" />
+    <defs>
+      <linearGradient id="looplyGradient" x1="0%" y1="50%" x2="100%" y2="50%">
+        <stop offset="0%" stopColor="#38bdf8" />
+        <stop offset="100%" stopColor="#4ade80" />
+      </linearGradient>
+    </defs>
+  </svg>
+);
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [hasVerifiedAge, setHasVerifiedAge] = useState(false);
+  const [appState, setAppState] = useState('idle'); 
+  const [error, setError] = useState('');
+  const [safetyAlert, setSafetyAlert] = useState(false);
+  
+  // Gemini AI States
+  const [icebreaker, setIcebreaker] = useState('');
+  const [isGeneratingIcebreaker, setIsGeneratingIcebreaker] = useState(false);
+  const [translation, setTranslation] = useState('');
+  const [translationActive, setTranslationActive] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
+
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [isVideoOff, setIsVideoOff] = useState(false);
+
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const remoteStreamRef = useRef(null);
+  const currentRoomRef = useRef(null);
+  const unsubscribersRef = useRef([]);
+  const safetyCheckIntervalRef = useRef(null);
+  const translationIntervalRef = useRef(null);
+
+  // Gemini API Helper
+  const callGemini = async (prompt, imageData = null) => {
+    const apiKey = ""; // Provided by environment
+    const model = "gemini-2.5-flash-preview-09-2025";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const parts = [{ text: prompt }];
+    if (imageData) {
+      parts.push({ inlineData: { mimeType: "image/jpeg", data: imageData } });
+    }
+
+    let retries = 0;
+    const maxRetries = 5;
+    
+    while (retries <= maxRetries) {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts }] })
+        });
+        const result = await response.json();
+        return result.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      } catch (err) {
+        if (retries === maxRetries) throw err;
+        const delay = Math.pow(2, retries) * 1000;
+        await new Promise(r => setTimeout(r, delay));
+        retries++;
+      }
+    }
+  };
+
+  // Auth Initialization (Rule 3)
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) { setError("Authentication error. Please refresh."); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // Safety & Translation Loops
+  useEffect(() => {
+    if (appState === 'connected') {
+      safetyCheckIntervalRef.current = setInterval(performSafetyCheck, 15000);
+      if (translationActive) {
+        translationIntervalRef.current = setInterval(performLiveTranslation, 8000);
+      }
+    } else {
+      clearInterval(safetyCheckIntervalRef.current);
+      clearInterval(translationIntervalRef.current);
+    }
+    return () => {
+      clearInterval(safetyCheckIntervalRef.current);
+      clearInterval(translationIntervalRef.current);
+    };
+  }, [appState, translationActive]);
+
+  const captureFrame = (quality = 0.3) => {
+    if (!remoteVideoRef.current || !canvasRef.current) return null;
+    const canvas = canvasRef.current;
+    const video = remoteVideoRef.current;
+    canvas.width = 320; 
+    canvas.height = 240;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', quality).split(',')[1];
+  };
+
+  const performSafetyCheck = async () => {
+    const base64 = captureFrame(0.2);
+    if (!base64) return;
+    try {
+      const response = await callGemini(
+        "Moderator mode: Analyze this video frame. If you see nudity, explicit content, or dangerous behavior, respond 'BLOCK'. Otherwise respond 'CLEAR'.", 
+        base64
+      );
+      if (response.includes('BLOCK')) {
+        setSafetyAlert(true);
+        skipAndNext();
+        setTimeout(() => setSafetyAlert(false), 5000);
+      }
+    } catch (e) {}
+  };
+
+  const performLiveTranslation = async () => {
+    const base64 = captureFrame(0.4);
+    if (!base64 || isTranslating) return;
+    setIsTranslating(true);
+    try {
+      const response = await callGemini(
+        "Analyze the person's vibe, expression, and background. Summarize their current 'energy' or likely topic of conversation in 3-5 words for a non-native speaker.", 
+        base64
+      );
+      setTranslation(response.trim());
+    } catch (e) {
+    } finally {
+      setIsTranslating(false);
+    }
+  };
+
+  const generateIcebreaker = async () => {
+    if (appState !== 'connected') return;
+    setIsGeneratingIcebreaker(true);
+    const base64 = captureFrame(0.5);
+    try {
+      const prompt = "Generate one unique, respectful icebreaker question to ask this person based on what you see in the frame. Max 15 words.";
+      const response = await callGemini(prompt, base64);
+      setIcebreaker(response);
+    } catch (e) {
+      setIcebreaker("What is one place you've always wanted to visit?");
+    } finally {
+      setIsGeneratingIcebreaker(false);
+    }
+  };
+
+  const cleanupConnection = async () => {
+    unsubscribersRef.current.forEach(unsub => unsub());
+    unsubscribersRef.current = [];
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    remoteStreamRef.current = null;
+    if (currentRoomRef.current && user) {
+      try { 
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomRef.current)); 
+      } catch (e) {}
+      currentRoomRef.current = null;
+    }
+  };
+
+  const startChat = async () => {
+    if (!user || !hasVerifiedAge) return;
+    setError('');
+    setAppState('loading_media');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      findPartner();
+    } catch (err) {
+      setError("Please enable camera/microphone to start looping.");
+      setAppState('idle');
+    }
+  };
+
+  const skipAndNext = async () => {
+    setAppState('searching');
+    setIcebreaker('');
+    setTranslation('');
+    await cleanupConnection();
+    findPartner();
+  };
+
+  const findPartner = async () => {
+    if (!user) return;
+    setAppState('searching');
+    const roomsRef = collection(db, 'artifacts', appId, 'public', 'data', 'rooms');
+    try {
+      const snapshot = await getDocs(roomsRef);
+      const available = snapshot.docs.filter(d => !d.data().answer && (Date.now() - d.data().createdAt < 30000));
+      
+      if (available.length > 0) {
+        const room = available[Math.floor(Math.random() * available.length)];
+        joinRoom(room.id, room.data());
+      } else { 
+        createRoom(); 
+      }
+    } catch (err) { 
+      setAppState('idle'); 
+      setError("Connection lost. Try again.");
+    }
+  };
+
+  const createRoom = async () => {
+    const pc = new RTCPeerConnection(configuration);
+    peerConnectionRef.current = pc;
+    if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
+
+    pc.ontrack = (e) => {
+      if (!remoteStreamRef.current) {
+        remoteStreamRef.current = new MediaStream();
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      }
+      e.streams[0].getTracks().forEach(t => remoteStreamRef.current.addTrack(t));
+      setAppState('connected');
+    };
+
+    const roomRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'rooms'));
+    currentRoomRef.current = roomRef.id;
+
+    pc.onicecandidate = (e) => e.candidate && addDoc(collection(roomRef, 'callerCandidates'), e.candidate.toJSON());
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    await setDoc(roomRef, { offer: { type: offer.type, sdp: offer.sdp }, createdAt: Date.now(), creatorId: user.uid });
+
+    unsubscribersRef.current.push(onSnapshot(roomRef, (s) => {
+      const d = s.data();
+      if (!pc.currentRemoteDescription && d?.answer) pc.setRemoteDescription(new RTCSessionDescription(d.answer));
+    }, () => {}));
+
+    unsubscribersRef.current.push(onSnapshot(collection(roomRef, 'calleeCandidates'), (s) => {
+      s.docChanges().forEach(c => c.type === 'added' && pc.addIceCandidate(new RTCIceCandidate(c.doc.data())));
+    }, () => {}));
+  };
+
+  const joinRoom = async (roomId, roomData) => {
+    const pc = new RTCPeerConnection(configuration);
+    peerConnectionRef.current = pc;
+    if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => pc.addTrack(t, localStreamRef.current));
+
+    pc.ontrack = (e) => {
+      if (!remoteStreamRef.current) {
+        remoteStreamRef.current = new MediaStream();
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      }
+      e.streams[0].getTracks().forEach(t => remoteStreamRef.current.addTrack(t));
+      setAppState('connected');
+    };
+
+    currentRoomRef.current = roomId;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+
+    pc.onicecandidate = (e) => e.candidate && addDoc(collection(roomRef, 'calleeCandidates'), e.candidate.toJSON());
+
+    await pc.setRemoteDescription(new RTCSessionDescription(roomData.offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    try { 
+      await updateDoc(roomRef, { answer: { type: answer.type, sdp: answer.sdp } }); 
+    } catch (e) { skipAndNext(); return; }
+
+    unsubscribersRef.current.push(onSnapshot(collection(roomRef, 'callerCandidates'), (s) => {
+      s.docChanges().forEach(c => c.type === 'added' && pc.addIceCandidate(new RTCIceCandidate(c.doc.data())));
+    }, () => {}));
+  };
+
+  const toggleMic = () => { if (localStreamRef.current) { const t = localStreamRef.current.getAudioTracks()[0]; t.enabled = !t.enabled; setIsMicMuted(!t.enabled); } };
+  const toggleVideo = () => { if (localStreamRef.current) { const t = localStreamRef.current.getVideoTracks()[0]; t.enabled = !t.enabled; setIsVideoOff(!t.enabled); } };
+
+  if (!hasVerifiedAge) {
+    return (
+      <div className="min-h-screen bg-[#020617] flex items-center justify-center p-6 text-white font-sans">
+        <div className="max-w-md w-full bg-slate-900/50 backdrop-blur-3xl border border-slate-800 rounded-[3rem] p-12 text-center shadow-2xl relative overflow-hidden">
+          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-sky-400 to-emerald-400"></div>
+          <div className="flex justify-center mb-8"><LooplyLogo className="w-24 h-14 animate-pulse" /></div>
+          <h1 className="text-4xl font-black mb-6 tracking-tight">Looply</h1>
+          <p className="text-slate-400 mb-12 text-lg leading-relaxed">Connect instantly with the world. ✨ AI-moderated for your safety. Must be 18+.</p>
+          <div className="flex flex-col gap-4">
+            <button onClick={() => setHasVerifiedAge(true)} className="bg-gradient-to-r from-sky-500 to-emerald-500 hover:scale-[1.02] text-white font-bold py-6 rounded-3xl transition-all shadow-xl shadow-emerald-500/20 active:scale-95 uppercase tracking-widest">ENTER LOOP</button>
+            <button onClick={() => window.location.href = 'https://google.com'} className="text-slate-500 text-sm hover:text-white transition-colors py-2">Exit</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#020617] text-white flex flex-col font-sans overflow-hidden">
+      <canvas ref={canvasRef} className="hidden" />
+
+      {/* Header */}
+      <header className="bg-slate-900/40 backdrop-blur-2xl p-4 border-b border-slate-800/50 flex justify-between items-center z-[100]">
+        <div className="flex items-center space-x-3 group cursor-pointer">
+          <LooplyLogo className="w-10 h-6 group-hover:rotate-12 transition-transform" />
+          <h1 className="text-xl font-black bg-gradient-to-r from-sky-400 to-emerald-400 bg-clip-text text-transparent uppercase tracking-tight">Looply</h1>
+        </div>
+        
+        <div className="flex items-center gap-4">
+          <div className="hidden sm:flex items-center bg-sky-500/10 text-sky-400 text-[10px] font-black px-4 py-2 rounded-full border border-sky-500/20">
+            <Zap className="w-3 h-3 mr-2 animate-pulse" /> ✨ GEMINI AI ACTIVE
+          </div>
+          <div className="flex items-center bg-emerald-500/10 text-emerald-400 text-[10px] font-black px-4 py-2 rounded-full border border-emerald-500/20">
+            <Shield className="w-3 h-3 mr-2" /> SAFETY ON
+          </div>
+        </div>
+      </header>
+
+      {/* Main Container */}
+      <main className="flex-1 flex flex-col p-4 md:p-8 gap-6 relative">
+        {safetyAlert && (
+          <div className="absolute top-10 left-1/2 -translate-x-1/2 z-[200] bg-red-600 text-white px-10 py-5 rounded-full flex items-center shadow-[0_0_50px_rgba(220,38,38,0.5)] animate-bounce border-2 border-white/20 font-black tracking-widest uppercase text-sm">
+            <ShieldAlert className="w-6 h-6 mr-3" /> ✨ AUTO-MOD: BLOCKED
+          </div>
+        )}
+
+        {appState === 'idle' ? (
+          <div className="flex-1 flex flex-col items-center justify-center text-center max-w-2xl mx-auto">
+            <div className="w-40 h-40 bg-sky-500/5 rounded-full flex items-center justify-center mb-12 border border-sky-500/10 relative">
+              <div className="absolute inset-0 bg-sky-500/20 blur-[80px] animate-pulse"></div>
+              <Play className="w-16 h-16 text-sky-400 relative z-10 ml-2" fill="currentColor" />
+            </div>
+            <h2 className="text-6xl font-black mb-6 tracking-tight leading-[0.9] text-white">Meet the <br/><span className="bg-gradient-to-r from-sky-400 to-emerald-400 bg-clip-text text-transparent">AI Generation.</span></h2>
+            <p className="text-slate-400 text-xl mb-12 max-w-md font-medium">Safe. Global. Smarter. Instant video connection powered by Gemini.</p>
+            <button onClick={startChat} className="bg-white text-black px-20 py-7 rounded-full font-black text-2xl hover:bg-slate-200 hover:scale-105 active:scale-95 transition-all shadow-[0_20px_50px_rgba(255,255,255,0.1)] uppercase tracking-wider">
+              START LOOPING
+            </button>
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col lg:flex-row gap-6 relative h-full">
+            {/* Remote Partner */}
+            <div className="flex-1 bg-slate-950 rounded-[3rem] overflow-hidden relative border border-slate-800 shadow-2xl min-h-[400px]">
+              {appState === 'searching' && (
+                <div className="absolute inset-0 bg-slate-900/98 z-20 flex flex-col items-center justify-center text-center">
+                  <div className="w-24 h-24 border-t-4 border-sky-500 rounded-full animate-spin mb-8"></div>
+                  <h3 className="text-2xl font-black text-white tracking-widest uppercase">SEARCHING...</h3>
+                  <p className="text-slate-500 mt-2 font-bold text-xs uppercase tracking-widest">Global ✨ AI Matchmaking Active</p>
+                </div>
+              )}
+              <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
+              
+              <div className="absolute top-8 left-8 flex flex-col gap-4">
+                <div className="bg-black/60 backdrop-blur-2xl px-5 py-2.5 rounded-full text-[11px] font-black flex items-center border border-white/10 uppercase tracking-[0.2em] w-fit">
+                  <span className="w-2 h-2 bg-emerald-500 rounded-full mr-3 animate-ping"></span> Live Stranger
+                </div>
+                
+                {translationActive && (
+                  <div className="bg-emerald-500 text-black px-6 py-3 rounded-2xl font-bold shadow-2xl animate-in slide-in-from-left duration-300 max-w-xs border-b-4 border-emerald-700">
+                    <div className="text-[9px] uppercase tracking-tighter opacity-70 mb-1 flex items-center">
+                      <Languages className="w-3 h-3 mr-1" /> ✨ AI VIBE CHECK
+                    </div>
+                    {isTranslating ? "✨ sensing..." : (translation || "Listening...")}
+                  </div>
+                )}
+              </div>
+
+              {/* Icebreaker Overlay */}
+              {icebreaker && (
+                <div className="absolute bottom-8 left-1/2 -translate-x-1/2 w-full max-w-lg px-6 z-30">
+                  <div className="bg-slate-900/95 backdrop-blur-3xl border border-sky-500/30 p-6 rounded-[2rem] shadow-2xl text-center">
+                    <div className="text-sky-400 text-[10px] font-black uppercase tracking-[0.3em] mb-3 flex justify-center items-center">
+                      <Sparkles className="w-3 h-3 mr-2" /> ✨ SUGGESTED ICEBREAKER
+                    </div>
+                    <p className="text-white text-lg font-bold leading-tight italic">"{icebreaker}"</p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Local Preview Sidebar */}
+            <div className="lg:w-80 flex flex-col gap-6">
+              <div className="aspect-[3/4] bg-slate-900 rounded-[2.5rem] overflow-hidden border-2 border-slate-800 shadow-2xl relative group">
+                <video ref={localVideoRef} autoPlay playsInline muted className={`w-full h-full object-cover ${isVideoOff ? 'opacity-0' : 'opacity-100'}`} style={{ transform: 'scaleX(-1)' }} />
+                {isVideoOff && <div className="absolute inset-0 flex items-center justify-center bg-slate-900"><CameraOff className="w-12 h-12 text-slate-800" /></div>}
+                <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-6">
+                   <p className="text-[10px] font-black tracking-widest uppercase text-white/50">Self</p>
+                </div>
+              </div>
+
+              {/* Gemini Control Hub */}
+              <div className="flex-1 bg-slate-900/30 border border-slate-800/50 rounded-[2.5rem] p-8 hidden lg:flex flex-col">
+                <h4 className="text-[10px] font-black uppercase text-slate-500 tracking-[0.3em] mb-8">✨ AI Hub</h4>
+                <div className="space-y-4">
+                  <button 
+                    onClick={generateIcebreaker}
+                    disabled={isGeneratingIcebreaker || appState !== 'connected'}
+                    className="w-full bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/30 text-sky-400 py-4 rounded-2xl font-black text-[11px] uppercase tracking-widest transition-all flex items-center justify-center disabled:opacity-30"
+                  >
+                    {isGeneratingIcebreaker ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4 mr-2" />}
+                    ✨ GET ICEBREAKER
+                  </button>
+                  
+                  <button 
+                    onClick={() => setTranslationActive(!translationActive)}
+                    disabled={appState !== 'connected'}
+                    className={`w-full border py-4 rounded-2xl font-black text-[11px] uppercase tracking-widest transition-all flex items-center justify-center disabled:opacity-30 ${translationActive ? 'bg-emerald-500 text-black border-emerald-500 shadow-lg' : 'bg-transparent border-slate-700 text-slate-400'}`}
+                  >
+                    <Languages className="w-4 h-4 mr-2" />
+                    {translationActive ? "TRANSLATE ON" : "✨ TRANSLATE OFF"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Footer Navigation */}
+      {appState !== 'idle' && (
+        <div className="p-8 pb-12 bg-slate-950 border-t border-slate-900 flex justify-center items-center gap-6 z-50">
+          <div className="flex gap-4">
+            <button onClick={toggleMic} className={`p-5 rounded-[1.8rem] transition-all border-2 ${isMicMuted ? 'bg-red-500/10 border-red-500/30 text-red-500' : 'bg-slate-900 border-slate-800 text-slate-300'}`}>
+              {isMicMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+            </button>
+            <button onClick={toggleVideo} className={`p-5 rounded-[1.8rem] transition-all border-2 ${isVideoOff ? 'bg-red-500/10 border-red-500/30 text-red-500' : 'bg-slate-900 border-slate-800 text-slate-300'}`}>
+              {isVideoOff ? <CameraOff className="w-6 h-6" /> : <Camera className="w-6 h-6" />}
+            </button>
+          </div>
+          
+          <button onClick={skipAndNext} className="bg-white text-black px-16 py-6 rounded-full font-black text-2xl flex items-center hover:bg-slate-200 transition-all active:scale-90 shadow-2xl hover:shadow-white/10 uppercase tracking-widest">
+            <SkipForward className="w-7 h-7 mr-3" /> NEXT
+          </button>
+          
+          <div className="flex gap-4">
+             <button 
+                onClick={generateIcebreaker}
+                disabled={isGeneratingIcebreaker || appState !== 'connected'}
+                className={`p-5 rounded-[1.8rem] transition-all border-2 ${icebreaker ? 'bg-sky-500 text-white border-sky-500' : 'bg-slate-900 border-slate-800 text-slate-300'}`}
+              >
+                {isGeneratingIcebreaker ? <Loader2 className="w-6 h-6 animate-spin" /> : <Sparkles className="w-6 h-6" />}
+              </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
